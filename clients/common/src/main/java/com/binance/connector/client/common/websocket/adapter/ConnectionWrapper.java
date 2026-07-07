@@ -40,8 +40,11 @@ import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -66,7 +69,7 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     private static final List<Integer> ERROR_CODE_WRONG_CREDENTIALS = Arrays.asList(-2015, -1022);
 
     protected Map<String, RequestWrapperDTO> pendingRequest = new HashMap<>();
-    protected Session session;
+    protected volatile Session session;
     protected Session oldSession;
 
     protected List<String> logonMethods = new ArrayList<>();
@@ -94,6 +97,20 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     private List<BlockingQueue<String>> streamQueues = new ArrayList<>();
 
     private Timer timer;
+
+    // Far below typical NAT/firewall idle timeout (60s) to keep the TCP flow alive
+    // when no application frames are flowing (e.g. illiquid bookTicker silence).
+    private static final long PING_INTERVAL_SECONDS = 30L;
+    // sendPing only reads the backing array; position/limit are untouched, so a
+    // single shared zero-length payload is safe across connections and threads.
+    private static final ByteBuffer EMPTY_PING_PAYLOAD = ByteBuffer.allocate(0);
+    private final ScheduledExecutorService pingScheduler;
+
+    // Optional application-level hook fired on abnormal close (anything that is
+    // not NORMAL/NO_CLOSE-expected). Invoked before the auto-reconnect so the
+    // caller can pause trading / surface an alert while the SDK is mid-reconnect.
+    // statusCode and reason are forwarded as-is from Jetty.
+    private volatile BiConsumer<Integer, String> onCloseHook;
 
     public ConnectionWrapper(WebSocketClientConfiguration configuration, Gson gson) {
         this(configuration, null, gson);
@@ -183,6 +200,29 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
                         },
                         reconnectAfter,
                         reconnectAfter);
+
+        // Proactive WebSocket PING frame keepalive. The SDK only reacts to inbound
+        // pings (onWebSocketPing) and never sends one, so when a shared market-data
+        // stream goes silent (e.g. bookTicker with no best-bid/ask change), NAT or
+        // firewall idle timers (commonly 60s) cut the TCP and we see code 1006
+        // "Session Closed" repeated every ~60s. Sending a protocol-level PING every
+        // 30s keeps the flow alive without consuming any business quota.
+        this.pingScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "binance-ws-ping-" + configuration.getUrl());
+            t.setDaemon(true);
+            return t;
+        });
+        this.pingScheduler.scheduleAtFixedRate(() -> {
+            Session s = this.session;
+            if (s == null || !s.isOpen()) {
+                return;
+            }
+            try {
+                s.getRemote().sendPing(EMPTY_PING_PAYLOAD);
+            } catch (Exception e) {
+                log.log(Level.WARNING, "failed to send websocket ping", e);
+            }
+        }, PING_INTERVAL_SECONDS, PING_INTERVAL_SECONDS, TimeUnit.SECONDS);
     }
 
     public void connect() {
@@ -251,7 +291,14 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     }
 
     public void onWebSocketPing(ByteBuffer payload) {
-        this.session.getRemote().sendPong(payload, WriteCallback.NOOP);
+        Session s = this.session;
+        if (s != null) {
+            s.getRemote().sendPong(payload, WriteCallback.NOOP);
+        }
+    }
+
+    public void setOnCloseHook(BiConsumer<Integer, String> hook) {
+        this.onCloseHook = hook;
     }
 
     public Map<String, RequestWrapperDTO> getPendingRequest() {
@@ -315,6 +362,14 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
         log.log(
                 Level.SEVERE,
                 "received websocket close, code: " + statusCode + " reason: " + reason);
+        BiConsumer<Integer, String> hook = this.onCloseHook;
+        if (hook != null) {
+            try {
+                hook.accept(statusCode, reason);
+            } catch (Throwable t) {
+                log.log(Level.WARNING, "onClose hook threw", t);
+            }
+        }
         if (canReconnect) {
             try {
                 connect();
@@ -585,6 +640,7 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
             setReady(false);
             canReconnect = false;
             timer.cancel();
+            pingScheduler.shutdownNow();
             webSocketClient.stop();
         }
     }
