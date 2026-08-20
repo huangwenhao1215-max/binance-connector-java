@@ -79,7 +79,10 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     // futures to hang until caller-side timeouts.
     protected Map<String, RequestWrapperDTO> pendingRequest = new ConcurrentHashMap<>();
     protected volatile Session session;
-    protected Session oldSession;
+    // volatile: written by the 23h reconnect Timer / connect callers, read from
+    // the Jetty read thread (onWebSocketText reconnect trigger, onWebSocketClose
+    // old-session check) with no other synchronization in between.
+    protected volatile Session oldSession;
 
     protected List<String> logonMethods = new ArrayList<>();
     protected List<String> logoutMethods = new ArrayList<>();
@@ -89,9 +92,13 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
                     "binance-connector-java/1.0.0 (Java/%s; %s; %s)",
                     SystemUtil.getJavaVersion(), SystemUtil.getOs(), SystemUtil.getArch());
 
-    private boolean isLoggedOn = false;
-    private boolean isReady = false;
-    private boolean canReconnect = true;
+    // volatile: these are written by the Jetty connect/close callbacks but read
+    // from caller threads (e.g. pool getConnection loops). Without volatile the
+    // reader may never observe setReady(true) after a reconnect — a tight loop
+    // on isReady can even be JIT-hoisted into an infinite loop.
+    private volatile boolean isLoggedOn = false;
+    private volatile boolean isReady = false;
+    private volatile boolean canReconnect = true;
     private final WebSocketClient webSocketClient;
     private final WebSocketClientConfiguration configuration;
     private final SignatureGeneratorFactory signatureGeneratorFactory =
@@ -101,7 +108,9 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
 
     private CountDownLatch countDownLatch;
 
-    private boolean pendingReconnect = false;
+    // volatile: set by the reconnect Timer / shutdown handler on their threads,
+    // checked by the Jetty read thread when in-flight requests drain.
+    private volatile boolean pendingReconnect = false;
 
     // CopyOnWriteArrayList: subscriptions add from caller threads while the
     // Jetty read thread iterates to offer events — same race pattern the plain
