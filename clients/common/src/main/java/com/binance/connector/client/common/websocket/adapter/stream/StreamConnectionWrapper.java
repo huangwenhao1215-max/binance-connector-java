@@ -13,6 +13,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.reflect.TypeToken;
 import java.lang.reflect.Type;
+import java.util.logging.Level;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -138,7 +139,13 @@ public class StreamConnectionWrapper extends ConnectionWrapper
                 queue.offer(data.toString());
             }
         } catch (Exception e) {
-            throw new ApiException(e);
+            // Swallow per-message failures: rethrowing propagates out of the Jetty
+            // callback and Jetty then closes the whole connection (1008). One bad
+            // message must not take down every stream multiplexed on this socket.
+            log.log(
+                    Level.SEVERE,
+                    "Exception while receiving message from WS connection",
+                    e);
         }
     }
 

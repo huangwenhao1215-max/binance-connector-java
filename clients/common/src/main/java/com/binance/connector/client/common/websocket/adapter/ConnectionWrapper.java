@@ -39,6 +39,8 @@ import java.util.TimerTask;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
@@ -61,14 +63,21 @@ import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
 
 public class ConnectionWrapper implements WebSocketListener, ConnectionInterface {
-    private static final Logger log = Logger.getLogger(ConnectionWrapper.class.getName());
+    // protected so subclasses (StreamConnectionWrapper) can log per-message
+    // processing failures instead of rethrowing them out of Jetty callbacks
+    // (Jetty closes the whole connection with 1008 when a frame handler throws).
+    protected static final Logger log = Logger.getLogger(ConnectionWrapper.class.getName());
 
     public static final int WAIT_TIME = 5;
     private static final String QUERY_PARAM_TIME_UNIT = "timeUnit";
     // -2015 for wrong API Keys, -1022 for wrong signature
     private static final List<Integer> ERROR_CODE_WRONG_CREDENTIALS = Arrays.asList(-2015, -1022);
 
-    protected Map<String, RequestWrapperDTO> pendingRequest = new HashMap<>();
+    // ConcurrentHashMap: requests are put from Jetty write callbacks and
+    // matched/removed from the Jetty read thread concurrently; the previous
+    // plain HashMap could drop entries under concurrency, leaving request
+    // futures to hang until caller-side timeouts.
+    protected Map<String, RequestWrapperDTO> pendingRequest = new ConcurrentHashMap<>();
     protected volatile Session session;
     protected Session oldSession;
 
@@ -94,7 +103,10 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
 
     private boolean pendingReconnect = false;
 
-    private List<BlockingQueue<String>> streamQueues = new ArrayList<>();
+    // CopyOnWriteArrayList: subscriptions add from caller threads while the
+    // Jetty read thread iterates to offer events — same race pattern the plain
+    // ArrayList had as the StreamConnectionWrapper subscriptions map.
+    private List<BlockingQueue<String>> streamQueues = new CopyOnWriteArrayList<>();
 
     private Timer timer;
 
@@ -544,8 +556,10 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
                 connect();
             }
         } catch (Exception e) {
+            // Swallow per-message failures: rethrowing propagates out of the Jetty
+            // callback and Jetty then closes the whole connection (1008). One bad
+            // message must not take down the shared connection.
             log.log(Level.SEVERE, "Exception while receiving message from WS connection", e);
-            throw new RuntimeException(e);
         }
     }
 

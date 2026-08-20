@@ -17,6 +17,14 @@ import java.util.TimerTask;
 
 public class StreamConnectionPoolWrapper implements StreamConnectionInterface {
 
+    // All stream operations are synchronized: the shared round-robin ListIterator
+    // `pool` and the `connectionStreamMap` HashMap were previously mutated by
+    // concurrent caller threads (subscribe/unsubscribe from many consumers),
+    // corrupting iterator state (NoSuchElementException / NPE / IndexOutOfBounds
+    // thrown into callers). These operations are low-frequency, so lock
+    // contention is a non-issue.
+    private static final long WAIT_FOR_READY_TIMEOUT_MS = 30_000;
+
     private final LinkedList<StreamConnectionWrapper> connectionList = new LinkedList<>();
     private ListIterator<StreamConnectionWrapper> pool;
     private Boolean isConnected = false;
@@ -92,7 +100,7 @@ public class StreamConnectionPoolWrapper implements StreamConnectionInterface {
         isConnected = false;
     }
 
-    public Map<String, StreamBlockingQueue<String>> subscribe(
+    public synchronized Map<String, StreamBlockingQueue<String>> subscribe(
             RequestWrapperDTO<Set<String>, Object> requestWrapperDTO) {
         Set<String> params = requestWrapperDTO.getParams();
         Map<String, StreamBlockingQueue<String>> queueMap = new HashMap<>();
@@ -109,13 +117,13 @@ public class StreamConnectionPoolWrapper implements StreamConnectionInterface {
     }
 
     @Override
-    public void unsubscribe(StreamBlockingQueue queue) {
+    public synchronized void unsubscribe(StreamBlockingQueue queue) {
         StreamConnectionWrapper connection = getConnection(queue.getOperationId());
         connection.unsubscribe(queue);
         connectionStreamMap.remove(queue.getOperationId());
     }
 
-    public StreamConnectionWrapper getConnection(String identifier) {
+    public synchronized StreamConnectionWrapper getConnection(String identifier) {
         if (connectionStreamMap.containsKey(identifier)) {
             return connectionStreamMap.get(identifier);
         }
@@ -127,22 +135,46 @@ public class StreamConnectionPoolWrapper implements StreamConnectionInterface {
     }
 
     /**
-     * @return the next connection from the pool, using round-robin
+     * @return the next connection from the pool, using round-robin.
+     *     If every connection is currently down (e.g. mid-reconnect after a close),
+     *     waits up to {@link #WAIT_FOR_READY_TIMEOUT_MS} for one to become ready
+     *     instead of spinning forever like the original implementation, then
+     *     throws IllegalStateException so callers can retry on their own schedule.
      */
-    public StreamConnectionWrapper getConnection() {
-        if (!pool.hasNext()) {
-            pool = connectionList.listIterator();
-        }
-        StreamConnectionWrapper connection = pool.next();
-        while (!connection.isReady()) {
+    public synchronized StreamConnectionWrapper getConnection() {
+        long deadline = System.currentTimeMillis() + WAIT_FOR_READY_TIMEOUT_MS;
+        while (true) {
             if (!pool.hasNext()) {
                 pool = connectionList.listIterator();
-            } else {
-                connection = pool.next();
+            }
+            StreamConnectionWrapper connection = pool.next();
+            int probed = 1;
+            while (!connection.isReady()) {
+                if (probed >= connectionList.size()) {
+                    break; // every connection probed, none ready
+                }
+                if (!pool.hasNext()) {
+                    pool = connectionList.listIterator();
+                } else {
+                    connection = pool.next();
+                }
+                probed++;
+            }
+            if (connection.isReady()) {
+                return connection;
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                throw new IllegalStateException(
+                        "no ready connection in pool after " + WAIT_FOR_READY_TIMEOUT_MS + "ms");
+            }
+            try {
+                wait(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(
+                        "interrupted while waiting for a ready connection", e);
             }
         }
-
-        return connection;
     }
 
     @Override
