@@ -13,7 +13,6 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.reflect.TypeToken;
 import java.lang.reflect.Type;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -22,6 +21,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingDeque;
 import org.eclipse.jetty.websocket.api.Session;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
@@ -29,8 +30,13 @@ import org.eclipse.jetty.websocket.client.WebSocketClient;
 public class StreamConnectionWrapper extends ConnectionWrapper
         implements StreamConnectionInterface {
     private Set<String> subcriptionsListResult = new HashSet<>();
-    private final HashMap<String, List<StreamBlockingQueue<String>>> subscriptions =
-            new HashMap<>();
+    // Mutated by consumer threads via subscribe/unsubscribe while the Jetty WS
+    // thread iterates the per-stream list in onWebSocketText. With the previous
+    // HashMap/ArrayList an unsubscribe racing the iterator threw
+    // NoSuchElementException out of the Jetty callback, and Jetty then closed
+    // the whole connection with code 1008. Concurrent structures remove that race.
+    private final Map<String, List<StreamBlockingQueue<String>>> subscriptions =
+            new ConcurrentHashMap<>();
 
     public StreamConnectionWrapper(WebSocketClientConfiguration configuration, Gson json) {
         super(configuration, json);
@@ -49,19 +55,15 @@ public class StreamConnectionWrapper extends ConnectionWrapper
             RequestWrapperDTO<Set<String>, Object> requestWrapperDTO) {
         HashMap<String, StreamBlockingQueue<String>> queueMap = new HashMap<>();
         for (String subscription : requestWrapperDTO.getParams()) {
-            List<StreamBlockingQueue<String>> blockingQueueList;
-            if (this.subscriptions.containsKey(subscription)) {
-                blockingQueueList = this.subscriptions.get(subscription);
-            } else {
-                blockingQueueList = new ArrayList<>();
-            }
+            List<StreamBlockingQueue<String>> blockingQueueList =
+                    this.subscriptions.computeIfAbsent(
+                            subscription, k -> new CopyOnWriteArrayList<>());
             BlockingQueue<String> blockingQueue = new LinkedBlockingDeque<>();
 
             StreamBlockingQueue blockingQueueWrapper =
                     new StreamBlockingQueue(blockingQueue, subscription);
 
             blockingQueueList.add(blockingQueueWrapper);
-            this.subscriptions.put(subscription, blockingQueueList);
             this.innerSend(requestWrapperDTO);
             queueMap.put(subscription, blockingQueueWrapper);
         }
@@ -76,7 +78,14 @@ public class StreamConnectionWrapper extends ConnectionWrapper
     public void unsubscribe(StreamBlockingQueue queue) {
         String operationId = queue.getOperationId();
         List<StreamBlockingQueue<String>> blockingQueues = subscriptions.get(operationId);
-        blockingQueues.remove(queue);
+        if (blockingQueues == null) {
+            return;
+        }
+        // remove() == false means another thread already removed this queue —
+        // skip so the server-side UNSUBSCRIBE is never sent twice.
+        if (!blockingQueues.remove(queue)) {
+            return;
+        }
 
         // unsubscribe from the stream if no more queue
         if (blockingQueues.isEmpty()) {
