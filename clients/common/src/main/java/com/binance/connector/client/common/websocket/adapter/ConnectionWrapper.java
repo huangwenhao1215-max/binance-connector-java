@@ -44,8 +44,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.logging.Level;
@@ -126,6 +129,24 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     // single shared zero-length payload is safe across connections and threads.
     private static final ByteBuffer EMPTY_PING_PAYLOAD = ByteBuffer.allocate(0);
     private final ScheduledExecutorService pingScheduler;
+
+    // Reconnect backoff. onWebSocketClose used to call connect() inline, which
+    // (a) ran on the Jetty callback thread and blocked it for the whole TCP+TLS
+    // handshake (connect() joins on the session promise), and (b) retried with
+    // zero delay, so a server that keeps rejecting us -- e.g. Binance closing
+    // with 1008 "Too many requests" -- turned into a tight reconnect loop that
+    // burns the 300-attempts-per-5min-per-IP budget and risks an IP ban.
+    // Reconnects now go on this scheduler with exponential backoff + jitter.
+    private static final long RECONNECT_BASE_DELAY_MS = 1_000L;
+    private static final long RECONNECT_MAX_DELAY_MS = 60_000L;
+    // How long a connection must survive to count as "stable", i.e. for the
+    // next drop to restart the backoff from scratch instead of continuing to
+    // escalate. Below this it is treated as flapping.
+    private static final long STABLE_CONNECTION_MS = 60_000L;
+    private final ScheduledExecutorService reconnectScheduler;
+    private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
+    // volatile: written on the connect path, read on the Jetty close callback.
+    private volatile long connectedAtMs = 0L;
 
     // Optional application-level hook fired on abnormal close (anything that is
     // not NORMAL/NO_CLOSE-expected). Invoked before the auto-reconnect so the
@@ -214,8 +235,16 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
                                     }
 
                                 } catch (Exception e) {
-                                    System.out.println(e);
-                                    throw new RuntimeException(e);
+                                    // Must not propagate: an exception out of a
+                                    // TimerTask kills the Timer thread for good,
+                                    // and this connection would then lose its
+                                    // periodic pre-emptive reconnect until the
+                                    // server force-closes it at the 24h mark.
+                                    log.log(
+                                            Level.SEVERE,
+                                            "periodic reconnect failed, retrying with backoff",
+                                            e);
+                                    scheduleReconnect();
                                 }
                             }
                         },
@@ -244,6 +273,15 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
                 log.log(Level.WARNING, "failed to send websocket ping", e);
             }
         }, PING_INTERVAL_SECONDS, PING_INTERVAL_SECONDS, TimeUnit.SECONDS);
+
+        // Separate executor from pingScheduler on purpose: connect() blocks for
+        // the whole handshake, and sharing the single-threaded ping executor
+        // would stall keepalive pings for the duration of every reconnect.
+        this.reconnectScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "binance-ws-reconnect-" + configuration.getUrl());
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     public void connect() {
@@ -391,12 +429,15 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
                 log.log(Level.WARNING, "onClose hook threw", t);
             }
         }
+        // Nothing in flight can ever be answered on a socket that just closed:
+        // pendingRequest is only drained in onWebSocketText. Leaving entries
+        // behind strands their callers' futures forever AND wedges every code
+        // path gated on canReconnect() (which requires pendingRequest to be
+        // empty) -- including the periodic reconnect timer.
+        failPendingRequests(statusCode + "/" + reason);
+
         if (canReconnect) {
-            try {
-                connect();
-            } catch (Exception e) {
-                log.log(Level.SEVERE, "Error while trying to reconnect", e);
-            }
+            scheduleReconnect();
         }
     }
 
@@ -583,7 +624,26 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
             JsonElement eElement = eventElemObj.get("e");
             if (eElement != null && "serverShutdown".equals(eElement.getAsString())) {
                 if (canReconnect()) {
-                    connect();
+                    // We are on the Jetty read thread here; connect() blocks for
+                    // the whole handshake, so hand it off. No backoff: this is a
+                    // planned server rotation announced on a still-live socket,
+                    // not a failure, and reconnecting promptly is the point.
+                    try {
+                        reconnectScheduler.execute(
+                                () -> {
+                                    try {
+                                        connect();
+                                    } catch (Exception e) {
+                                        log.log(
+                                                Level.SEVERE,
+                                                "Error while reconnecting after serverShutdown",
+                                                e);
+                                        scheduleReconnect();
+                                    }
+                                });
+                    } catch (RejectedExecutionException e) {
+                        log.info("reconnect scheduler is shut down, skipping serverShutdown reconnect");
+                    }
                 } else {
                     pendingReconnect = true;
                 }
@@ -591,6 +651,96 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
             }
         }
         return false;
+    }
+
+    /**
+     * Complete every in-flight request exceptionally and drop it.
+     *
+     * <p>Removes entry-by-entry rather than iterate-then-clear(): a request
+     * registered concurrently would otherwise be discarded by the clear()
+     * without ever being completed, stranding its caller.
+     */
+    private void failPendingRequests(String reason) {
+        if (pendingRequest.isEmpty()) {
+            return;
+        }
+        int failed = 0;
+        for (String id : pendingRequest.keySet()) {
+            RequestWrapperDTO request = pendingRequest.remove(id);
+            if (request == null) {
+                continue;
+            }
+            failed++;
+            try {
+                request.getResponseCallback()
+                        .completeExceptionally(
+                                new ApiException("websocket closed before response: " + reason));
+            } catch (Exception e) {
+                log.log(Level.WARNING, "failed to complete pending request exceptionally", e);
+            }
+        }
+        if (failed > 0) {
+            log.info("failed " + failed + " in-flight request(s) after websocket close: " + reason);
+        }
+    }
+
+    /**
+     * Queue a reconnect on the dedicated scheduler after an exponentially
+     * backed-off, jittered delay. Never call connect() straight from a Jetty
+     * callback: it blocks on the session promise and would hold up the WS read
+     * thread. The jitter matters when many wrappers/processes are knocked off
+     * by the same server-side event -- without it they all retry in lockstep
+     * and recreate the overload that closed them.
+     */
+    private void scheduleReconnect() {
+        // A connection that stayed up a while and then dropped is a fresh
+        // incident, not an escalating failure -- restart the backoff. Resetting
+        // on every successful handshake instead (the obvious place) is wrong:
+        // when Binance accepts the TCP upgrade and only then closes with 1008,
+        // every cycle would look "successful" and the delay would never grow
+        // past the first step, which is exactly when backoff is needed most.
+        long connectedAt = connectedAtMs;
+        if (connectedAt > 0 && System.currentTimeMillis() - connectedAt >= STABLE_CONNECTION_MS) {
+            reconnectAttempts.set(0);
+        }
+        // Consume it so the recursive retry below cannot re-trigger the reset.
+        connectedAtMs = 0L;
+
+        int attempt = reconnectAttempts.getAndIncrement();
+        long backoffMs =
+                Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS << Math.min(attempt, 6));
+        long delayMs = backoffMs / 2 + ThreadLocalRandom.current().nextLong(backoffMs / 2 + 1);
+        log.info(
+                "scheduling websocket reconnect attempt "
+                        + (attempt + 1)
+                        + " in "
+                        + delayMs
+                        + "ms");
+        try {
+            reconnectScheduler.schedule(
+                    () -> {
+                        // Deliberately NOT gated on canReconnect(): that predicate
+                        // (isReady && pendingRequest.isEmpty()) exists to stop the
+                        // periodic 24h timer from cutting a HEALTHY connection out
+                        // from under in-flight work. On a socket that already died
+                        // it is meaningless, and bailing here would leave the
+                        // connection down for good. The caller checked the
+                        // canReconnect flag before scheduling us.
+                        try {
+                            connect();
+                        } catch (Exception e) {
+                            log.log(Level.SEVERE, "Error while trying to reconnect", e);
+                            // Failed attempt: queue the next one, otherwise a
+                            // connect() that throws would end reconnection for good.
+                            scheduleReconnect();
+                        }
+                    },
+                    delayMs,
+                    TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            // Scheduler already shut down (disconnect/close path) — nothing to do.
+            log.info("reconnect scheduler is shut down, skipping reconnect");
+        }
     }
 
     protected void beforeConnect() {
@@ -606,6 +756,10 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
             this.oldSession.close(StatusCode.NORMAL, "close after reconnect", WriteCallback.NOOP);
         }
         canReconnect = true;
+        // Only stamp the time here; whether this counts as a recovery that
+        // resets the backoff is decided at the NEXT close, based on how long
+        // the connection actually survived. See scheduleReconnect().
+        connectedAtMs = System.currentTimeMillis();
         setReady(true);
     }
 
@@ -664,6 +818,7 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
             canReconnect = false;
             timer.cancel();
             pingScheduler.shutdownNow();
+            reconnectScheduler.shutdownNow();
             webSocketClient.stop();
         }
     }

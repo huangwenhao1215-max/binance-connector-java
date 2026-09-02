@@ -11,7 +11,6 @@ import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.google.gson.reflect.TypeToken;
 import java.lang.reflect.Type;
 import java.util.logging.Level;
 import java.util.Collections;
@@ -30,7 +29,10 @@ import org.eclipse.jetty.websocket.client.WebSocketClient;
 
 public class StreamConnectionWrapper extends ConnectionWrapper
         implements StreamConnectionInterface {
-    private Set<String> subcriptionsListResult = new HashSet<>();
+    // NOTE: the former `subcriptionsListResult` field (populated from the
+    // server's LIST_SUBSCRIPTIONS reply) is gone -- afterConnect now restores
+    // straight from `subscriptions`, which is correct even after an abrupt
+    // server-side close. See beforeConnect/afterConnect below.
     // Mutated by consumer threads via subscribe/unsubscribe while the Jetty WS
     // thread iterates the per-stream list in onWebSocketText. With the previous
     // HashMap/ArrayList an unsubscribe racing the iterator threw
@@ -65,7 +67,19 @@ public class StreamConnectionWrapper extends ConnectionWrapper
                     new StreamBlockingQueue(blockingQueue, subscription);
 
             blockingQueueList.add(blockingQueueWrapper);
-            this.innerSend(requestWrapperDTO);
+            try {
+                this.innerSend(requestWrapperDTO);
+            } catch (RuntimeException e) {
+                // Send failed (typically a dead session). Undo the local
+                // registration: leaving it behind strands a queue nobody will
+                // ever poll and, worse, leaves a key that afterConnect would
+                // treat as a live subscription and resurrect on every reconnect.
+                blockingQueueList.remove(blockingQueueWrapper);
+                if (blockingQueueList.isEmpty()) {
+                    this.subscriptions.remove(subscription, blockingQueueList);
+                }
+                throw e;
+            }
             queueMap.put(subscription, blockingQueueWrapper);
         }
 
@@ -90,6 +104,11 @@ public class StreamConnectionWrapper extends ConnectionWrapper
 
         // unsubscribe from the stream if no more queue
         if (blockingQueues.isEmpty()) {
+            // Drop the now-empty entry too, so it cannot be mistaken for a live
+            // subscription later (afterConnect restores from this map). remove
+            // (key, value) so a concurrent re-subscribe that just installed a
+            // fresh list for this stream is not clobbered.
+            subscriptions.remove(operationId, blockingQueues);
             RequestWrapperDTO listSubscriptions =
                     new RequestWrapperDTO.Builder<>()
                             .id(UUID.randomUUID().toString())
@@ -150,39 +169,44 @@ public class StreamConnectionWrapper extends ConnectionWrapper
     }
 
     protected void beforeConnect() {
-        // no session, so this is not a reconnect
-        if (this.session == null || !this.session.isOpen()) {
-            return;
-        }
-        RequestWrapperDTO<Object, HashSet<String>> listSubscriptions =
-                new RequestWrapperDTO.Builder<Object, HashSet<String>>()
-                        .id(UUID.randomUUID().toString())
-                        .method("LIST_SUBSCRIPTIONS")
-                        .responseType(new TypeToken<HashSet<String>>() {}.getType())
-                        .build();
-
-        this.send(listSubscriptions);
-
-        listSubscriptions
-                .getResponseCallback()
-                .thenAccept(
-                        (response) -> {
-                            subcriptionsListResult = response;
-                            super.beforeConnect();
-                        });
+        // Previously this asked the SERVER for the subscription list via
+        // LIST_SUBSCRIPTIONS, but it bailed out whenever the old session was
+        // already closed -- which is precisely the case after a server-side
+        // close (1006/1008), i.e. the only situation reconnect-resubscribe
+        // exists for. The `subscriptions` map below is the authoritative local
+        // record of what this wrapper subscribed to (its keys ARE the stream
+        // names passed to SUBSCRIBE, see subscribe()), so afterConnect now
+        // restores from that and no round trip is needed here at all.
+        super.beforeConnect();
     }
 
     protected void afterConnect(Session session) {
-        if (!subcriptionsListResult.isEmpty()) {
+        // super FIRST: send() targets this.session, and the base method is what
+        // swaps this.session over to the freshly established one. Sending before
+        // it would put the restore frame on the old, already-dead session.
+        super.afterConnect(session);
+
+        // Skip empty lists. unsubscribe()/subscribe() now drop the entry when
+        // its last queue goes away, so this should not trigger -- it is kept as
+        // a cheap guard because anything that did leak through would be
+        // resurrected on every single reconnect, with the server pushing a
+        // stream nobody consumes for the rest of the connection's life.
+        Set<String> streams = new HashSet<>();
+        subscriptions.forEach(
+                (stream, queues) -> {
+                    if (queues != null && !queues.isEmpty()) {
+                        streams.add(stream);
+                    }
+                });
+        if (!streams.isEmpty()) {
             RequestWrapperDTO subscribe =
                     new RequestWrapperDTO.Builder<>()
                             .id(UUID.randomUUID().toString())
                             .method("SUBSCRIBE")
-                            .params(subcriptionsListResult)
+                            .params(streams)
                             .build();
 
             this.send(subscribe);
         }
-        super.afterConnect(session);
     }
 }
