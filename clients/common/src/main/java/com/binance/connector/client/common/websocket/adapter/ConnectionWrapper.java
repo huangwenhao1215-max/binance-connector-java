@@ -154,6 +154,15 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     // statusCode and reason are forwarded as-is from Jetty.
     private volatile BiConsumer<Integer, String> onCloseHook;
 
+    // Optional application-level hook fired every time this connection becomes
+    // ready (initial connect and every successful reconnect alike), right after
+    // isReady flips true in afterConnect(). This only proves the transport/session
+    // is up, same caveat as isConnected()/isReady() -- it fires before
+    // StreamConnectionWrapper.afterConnect() has sent its restore SUBSCRIBE, so it
+    // is NOT proof that subscriptions are restored or data is flowing again.
+    // Callers needing that stronger guarantee must still key off actual messages.
+    private volatile Runnable onConnectHook;
+
     public ConnectionWrapper(WebSocketClientConfiguration configuration, Gson gson) {
         this(configuration, null, gson);
     }
@@ -358,6 +367,10 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
 
     public void setOnCloseHook(BiConsumer<Integer, String> hook) {
         this.onCloseHook = hook;
+    }
+
+    public void setOnConnectHook(Runnable hook) {
+        this.onConnectHook = hook;
     }
 
     public Map<String, RequestWrapperDTO> getPendingRequest() {
@@ -761,6 +774,15 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
         // the connection actually survived. See scheduleReconnect().
         connectedAtMs = System.currentTimeMillis();
         setReady(true);
+
+        Runnable connectHook = this.onConnectHook;
+        if (connectHook != null) {
+            try {
+                connectHook.run();
+            } catch (Throwable t) {
+                log.log(Level.WARNING, "onConnect hook threw", t);
+            }
+        }
     }
 
     @Override
