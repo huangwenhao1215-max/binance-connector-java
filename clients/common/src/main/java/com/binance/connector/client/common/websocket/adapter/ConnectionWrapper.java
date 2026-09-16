@@ -409,9 +409,27 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     @Override
     public void onWebSocketError(Throwable cause) {
         if (cause instanceof ClosedChannelException) {
-            log.info("channel was closed: " + cause.getMessage());
+            // ClosedChannelException is a marker exception and never carries a
+            // message, so logging getMessage() alone always printed "null" and
+            // discarded the only two things that identify how the channel died:
+            // the stack (read path means the peer went away; write path means a
+            // send -- e.g. the keepalive PING -- was what noticed it) and the
+            // peer it was talking to. Both are needed to tell a server-side RST
+            // apart from a local close, and to attribute repeated 1006s to a
+            // specific endpoint IP when the host resolves to many nodes.
+            log.log(Level.INFO, "channel was closed, remote=" + remoteAddress(), cause);
         } else {
             log.log(Level.SEVERE, "received webSocket error", cause);
+        }
+    }
+
+    /** Best-effort peer address for diagnostics only; never throws. */
+    private String remoteAddress() {
+        try {
+            Session s = this.session;
+            return s == null ? "n/a" : String.valueOf(s.getRemoteAddress());
+        } catch (Throwable t) {
+            return "n/a";
         }
     }
 
@@ -433,7 +451,12 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
         }
         log.log(
                 Level.SEVERE,
-                "received websocket close, code: " + statusCode + " reason: " + reason);
+                "received websocket close, code: "
+                        + statusCode
+                        + " reason: "
+                        + reason
+                        + " remote="
+                        + remoteAddress());
         BiConsumer<Integer, String> hook = this.onCloseHook;
         if (hook != null) {
             try {
@@ -569,6 +592,8 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     @Override
     public void onWebSocketConnect(Session session) {
         this.session = session;
+        log.info("websocket connected: url=" + configuration.getUrl()
+                + " remote=" + (session.getRemoteAddress() == null ? "null" : session.getRemoteAddress()));
         // No need to demand here, because this endpoint is auto-demanding.
     }
 
