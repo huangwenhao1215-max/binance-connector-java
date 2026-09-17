@@ -142,11 +142,25 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     // How long a connection must survive to count as "stable", i.e. for the
     // next drop to restart the backoff from scratch instead of continuing to
     // escalate. Below this it is treated as flapping.
-    private static final long STABLE_CONNECTION_MS = 60_000L;
+    //
+    // Raised 60s -> 120s: 60s was too generous. A connection that only lasts
+    // 80 seconds is plainly unhealthy, yet it counted as "recovered" and reset
+    // the attempt counter, so a link that kept dying at ~80s intervals never
+    // escalated past the first backoff step and kept hammering the server at
+    // sub-second delays. Measured on a 40-minute production log (survival times
+    // 31/15.5/22.5/136/25/79/56/197/1494/9/13s), 60s reset the counter four
+    // times where 120s resets it three -- the difference being that 79s
+    // connection, which plainly should not have counted as recovered.
+    private static final long STABLE_CONNECTION_MS = 120_000L;
     private final ScheduledExecutorService reconnectScheduler;
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
     // volatile: written on the connect path, read on the Jetty close callback.
     private volatile long connectedAtMs = 0L;
+
+    // Peer address captured at connect time, for diagnostics. Same volatile
+    // rationale as connectedAtMs; see onWebSocketConnect for why it cannot be
+    // read lazily in the close callback.
+    private volatile String connectedRemote;
 
     // Optional application-level hook fired on abnormal close (anything that is
     // not NORMAL/NO_CLOSE-expected). Invoked before the auto-reconnect so the
@@ -369,6 +383,7 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
         this.onCloseHook = hook;
     }
 
+
     public void setOnConnectHook(Runnable hook) {
         this.onConnectHook = hook;
     }
@@ -425,6 +440,12 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
 
     /** Best-effort peer address for diagnostics only; never throws. */
     private String remoteAddress() {
+        // Recorded at connect time, see onWebSocketConnect. The live session is
+        // only a fallback for the window before the first connect completes.
+        String recorded = this.connectedRemote;
+        if (recorded != null) {
+            return recorded;
+        }
         try {
             Session s = this.session;
             return s == null ? "n/a" : String.valueOf(s.getRemoteAddress());
@@ -592,8 +613,18 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
     @Override
     public void onWebSocketConnect(Session session) {
         this.session = session;
+        // Snapshot the peer here: Jetty drops the remote address once the session
+        // is closed, and the close/error callbacks -- the only place we actually
+        // need it -- run after that. Reading it on the spot there always yields
+        // null, which is exactly what the first round of 1006 diagnostics hit.
+        try {
+            java.net.SocketAddress remote = session.getRemoteAddress();
+            this.connectedRemote = remote == null ? null : String.valueOf(remote);
+        } catch (Throwable ignored) {
+            this.connectedRemote = null;
+        }
         log.info("websocket connected: url=" + configuration.getUrl()
-                + " remote=" + (session.getRemoteAddress() == null ? "null" : session.getRemoteAddress()));
+                + " remote=" + (this.connectedRemote == null ? "null" : this.connectedRemote));
         // No need to demand here, because this endpoint is auto-demanding.
     }
 
