@@ -541,6 +541,11 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
         return streamQueue;
     }
 
+    @Override
+    public boolean removeStreamQueue(BlockingQueue<String> queue) {
+        return queue != null && streamQueues.remove(queue);
+    }
+
     public void innerSend(RequestWrapperDTO requestWrapperDTO) {
         send(requestWrapperDTO);
     }

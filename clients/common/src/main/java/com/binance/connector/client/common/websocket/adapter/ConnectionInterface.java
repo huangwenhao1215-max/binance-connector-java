@@ -16,6 +16,17 @@ public interface ConnectionInterface {
 
     BlockingQueue<String> sendForStream(ApiRequestWrapperDTO request) throws InterruptedException;
 
+    /**
+     * Stop feeding a queue returned by {@link #sendForStream}. Every inbound stream event is
+     * offered to every registered queue, so a caller that re-subscribes (getting a new queue)
+     * must drop the old one, or the abandoned queue keeps growing with every event.
+     *
+     * @return true if the queue was registered and is now removed
+     */
+    default boolean removeStreamQueue(BlockingQueue<String> queue) {
+        return false;
+    }
+
     void send(RequestWrapperDTO request) throws InterruptedException;
 
     void setUserAgent(String userAgent);
