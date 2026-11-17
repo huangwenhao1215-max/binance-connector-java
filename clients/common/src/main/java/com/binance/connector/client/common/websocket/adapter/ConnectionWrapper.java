@@ -537,7 +537,15 @@ public class ConnectionWrapper implements WebSocketListener, ConnectionInterface
             throws InterruptedException {
         LinkedBlockingDeque<String> streamQueue = new LinkedBlockingDeque<>();
         streamQueues.add(streamQueue);
-        send(request);
+        try {
+            send(request);
+        } catch (RuntimeException e) {
+            // The caller never receives the queue, so it can never removeStreamQueue it:
+            // drop it here or it leaks (e.g. a resubscribe while the socket is reconnecting
+            // throws from send on the closed/null session, once per retry).
+            streamQueues.remove(streamQueue);
+            throw e;
+        }
         return streamQueue;
     }
 
